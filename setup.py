@@ -170,22 +170,22 @@ def get_extension_hybrid_ep_cpp():
     return extension_hybrid_ep_cpp
 
 def get_extension_deep_ep_cpp():
-    disable_nvshmem = False
-    nvshmem_dir = os.getenv('NVSHMEM_DIR', None)
-    nvshmem_host_lib = 'libnvshmem_host.so'
-    if nvshmem_dir is None:
-        try:
-            nvshmem_dir = importlib.util.find_spec("nvidia.nvshmem").submodule_search_locations[0]
-            nvshmem_host_lib = get_nvshmem_host_lib_name(nvshmem_dir)
-            import nvidia.nvshmem as nvshmem
-        except (ModuleNotFoundError, AttributeError, IndexError):
-            print('Warning: `NVSHMEM_DIR` is not specified, and the NVSHMEM module is not installed. All internode and low-latency features are disabled\n')
-            disable_nvshmem = True
-    else:
-        disable_nvshmem = False
+    disable_nvshmem = True
+    # nvshmem_dir = os.getenv('NVSHMEM_DIR', None)
+    # nvshmem_host_lib = 'libnvshmem_host.so'
+    # if nvshmem_dir is None:
+    #     try:
+    #         nvshmem_dir = importlib.util.find_spec("nvidia.nvshmem").submodule_search_locations[0]
+    #         nvshmem_host_lib = get_nvshmem_host_lib_name(nvshmem_dir)
+    #         import nvidia.nvshmem as nvshmem
+    #     except (ModuleNotFoundError, AttributeError, IndexError):
+    #         print('Warning: `NVSHMEM_DIR` is not specified, and the NVSHMEM module is not installed. All internode and low-latency features are disabled\n')
+    #         disable_nvshmem = True
+    # else:
+    #     disable_nvshmem = False
 
-    if not disable_nvshmem:
-        assert os.path.exists(nvshmem_dir), f'The specified NVSHMEM directory does not exist: {nvshmem_dir}'
+    # if not disable_nvshmem:
+    #     assert os.path.exists(nvshmem_dir), f'The specified NVSHMEM directory does not exist: {nvshmem_dir}'
 
     cxx_flags = ['-O3', '-Wno-deprecated-declarations', '-Wno-unused-variable',
                  '-Wno-sign-compare', '-Wno-reorder', '-Wno-attributes']
@@ -254,7 +254,7 @@ def get_extension_deep_ep_cpp():
     print(f' > Compilation flags: {extra_compile_args}')
     print(f' > Link flags: {extra_link_args}')
     print(f' > Arch list: {os.environ["TORCH_CUDA_ARCH_LIST"]}')
-    print(f' > NVSHMEM path: {nvshmem_dir}')
+    # print(f' > NVSHMEM path: {nvshmem_dir}')
     print()
 
     extension_deep_ep_cpp = CUDAExtension(

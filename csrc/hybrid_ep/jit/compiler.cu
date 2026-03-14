@@ -24,7 +24,7 @@ std::string get_jit_dir() {
             cache_dir = "/tmp";  // Fallback 
         }
     }
-    return cache_dir + "/.deepep/hybrid_ep/jit";
+    return cache_dir + "/hybridep_jit_cache";
 }
 
 NVCCCompiler::NVCCCompiler(std::string base_path, std::string comm_id): 
@@ -108,6 +108,10 @@ std::string NVCCCompiler::build(std::string code, std::string signature, int loc
     }
     
     // Run the compile command
+    bool enable_jit_log = get_env("HYBRID_EP_ENABLE_JIT_LOG") == "1";
+    if (enable_jit_log) {
+        printf("Start JIT compilation: %s\n", compile_command.c_str());
+    }
     auto ret = std::system(compile_command.c_str());
     if (ret != 0) {
         throw std::runtime_error("Failed to compile the code, compile command: " + compile_command);
