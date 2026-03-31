@@ -5,6 +5,20 @@
 #include <vector>
 #include <cstdint>
 
+namespace {
+
+inline int get_intra_node_prob_stride(const HybridEpConfigInstance& config) {
+    return config.num_of_nodes == 1
+        ? config.num_of_experts_per_rank
+        : config.num_of_experts_per_rank * config.num_of_ranks_per_node;
+}
+
+inline int get_dense_node_prob_width(const HybridEpConfigInstance& config) {
+    return config.num_of_experts_per_rank * config.num_of_ranks_per_node;
+}
+
+}  // namespace
+
 Executor::Executor(int local_rank, int node_rank, std::string base_path, std::string comm_id, bool load_cached_kernels, bool enable_custom_allgather) : local_rank(local_rank), node_rank(node_rank), kernel_cache(node_rank, local_rank, base_path, comm_id, load_cached_kernels), enable_custom_allgather(enable_custom_allgather) {}  
 
 void Executor::set_intra_node_buffers(IntraNodeDispatchBuffers *intra_node_dispatch_buffers, IntraNodeCombineBuffers *intra_node_combine_buffers) {
@@ -267,10 +281,12 @@ Executor::dispatch_postprocess(HybridEpConfigInstance config, DispatchArgs& args
         permute_args.num_permuted_token = args.num_permuted_tokens;
         permute_args.num_ranks_per_node = config.num_of_ranks_per_node;
         permute_args.num_of_local_experts = config.num_of_experts_per_rank;
+        permute_args.prob_stride = get_intra_node_prob_stride(config);
         permute_args.pad_multiple = args.pad_multiple;
         permute_args.local_rank = local_rank;
         permute_args.use_fp8 = config.token_data_type == APP_TOKEN_DATA_TYPE::UINT8;
         permute_args.with_probs = config.forward_dispatch_api;
+        permute_args.probs_are_local = config.num_of_nodes == 1;
         permute_args.token_options = args.hidden.options();
         permute_args.stream = args.stream;
         permute_args.num_of_blocks_permute_api = config.num_of_blocks_permute_api;
@@ -301,13 +317,32 @@ Executor::dispatch_postprocess(HybridEpConfigInstance config, DispatchArgs& args
         CUDA_CHECK(cudaMemcpyAsync(dispatched_tokens.data_ptr(), intra_node_dispatch_buffers->expert_output_token, res_sz, cudaMemcpyDeviceToDevice, args.stream));
 
         if(config.forward_dispatch_api) {
-            dispatched_probs = torch::empty({num_dispatched_tokens,
-                config.num_of_experts_per_rank * config.num_of_ranks_per_node},
+            const int dense_prob_width = get_dense_node_prob_width(config);
+            dispatched_probs = torch::empty({num_dispatched_tokens, dense_prob_width},
                             torch::dtype(torch::kFloat32).device(torch::kCUDA));
-            auto probs_sz = static_cast<size_t>(num_dispatched_tokens) * config.num_of_experts_per_rank * config.num_of_ranks_per_node * sizeof(float);
-            CUDA_CHECK(cudaMemcpyAsync(dispatched_probs.value().data_ptr<float>(),
-                intra_node_dispatch_buffers->expert_output_prob,
-                probs_sz, cudaMemcpyDeviceToDevice, args.stream));
+            if (config.num_of_nodes == 1) {
+                auto* dst_probs = dispatched_probs.value().data_ptr<float>();
+                const auto* src_probs = intra_node_dispatch_buffers->expert_output_prob;
+                const size_t dense_prob_bytes =
+                    static_cast<size_t>(num_dispatched_tokens) * dense_prob_width * sizeof(float);
+                const size_t slice_bytes =
+                    static_cast<size_t>(config.num_of_experts_per_rank) * sizeof(float);
+                CUDA_CHECK(cudaMemsetAsync(dst_probs, 0, dense_prob_bytes, args.stream));
+                CUDA_CHECK(cudaMemcpy2DAsync(
+                    dst_probs + local_rank * config.num_of_experts_per_rank,
+                    static_cast<size_t>(dense_prob_width) * sizeof(float),
+                    src_probs,
+                    static_cast<size_t>(config.num_of_experts_per_rank) * sizeof(float),
+                    slice_bytes,
+                    num_dispatched_tokens,
+                    cudaMemcpyDeviceToDevice,
+                    args.stream));
+            } else {
+                auto probs_sz = static_cast<size_t>(num_dispatched_tokens) * dense_prob_width * sizeof(float);
+                CUDA_CHECK(cudaMemcpyAsync(dispatched_probs.value().data_ptr<float>(),
+                    intra_node_dispatch_buffers->expert_output_prob,
+                    probs_sz, cudaMemcpyDeviceToDevice, args.stream));
+            }
         }
 
         if(config.token_data_type == APP_TOKEN_DATA_TYPE::UINT8) {
@@ -344,11 +379,13 @@ void Executor::combine_preprocess(HybridEpConfigInstance config, CombineArgs& ar
         unpermute_args.row_id_map = args.row_id_map.value();
         unpermute_args.num_of_local_experts = config.num_of_experts_per_rank;
         unpermute_args.num_dispatched_tokens_tensor = num_dispatched_tokens_tensor;
+        unpermute_args.prob_stride = get_intra_node_prob_stride(config);
         unpermute_args.pad_multiple = args.pad_multiple;
         unpermute_args.hidden_size = config.hidden_dim;
         unpermute_args.local_rank = local_rank;
         unpermute_args.num_ranks_per_node = config.num_of_ranks_per_node;
         unpermute_args.with_probs = config.backward_combine_api;
+        unpermute_args.probs_are_local = config.num_of_nodes == 1;
         unpermute_args.stream = args.stream;
         unpermute_args.num_of_blocks_permute_api = config.num_of_blocks_permute_api;
         
@@ -362,10 +399,24 @@ void Executor::combine_preprocess(HybridEpConfigInstance config, CombineArgs& ar
                             reinterpret_cast<uint16_t *>(args.hidden.data_ptr()), input_sz,
                             cudaMemcpyDeviceToDevice, args.stream));
         if (config.backward_combine_api) {
-            auto probs_sz = args.probs.numel() * sizeof(float);
-            CUDA_CHECK(cudaMemcpyAsync(intra_node_combine_buffers->expert_input_prob,
-                                       reinterpret_cast<float*>(args.probs.data_ptr()), probs_sz,
-                                       cudaMemcpyDeviceToDevice, args.stream));
+            if (config.num_of_nodes == 1) {
+                const int dense_prob_width = get_dense_node_prob_width(config);
+                CUDA_CHECK(cudaMemcpy2DAsync(
+                    intra_node_combine_buffers->expert_input_prob,
+                    static_cast<size_t>(config.num_of_experts_per_rank) * sizeof(float),
+                    reinterpret_cast<float*>(args.probs.data_ptr()) +
+                        local_rank * config.num_of_experts_per_rank,
+                    static_cast<size_t>(dense_prob_width) * sizeof(float),
+                    static_cast<size_t>(config.num_of_experts_per_rank) * sizeof(float),
+                    args.probs.size(0),
+                    cudaMemcpyDeviceToDevice,
+                    args.stream));
+            } else {
+                auto probs_sz = args.probs.numel() * sizeof(float);
+                CUDA_CHECK(cudaMemcpyAsync(intra_node_combine_buffers->expert_input_prob,
+                                           reinterpret_cast<float*>(args.probs.data_ptr()), probs_sz,
+                                           cudaMemcpyDeviceToDevice, args.stream));
+            }
         }
     }
 

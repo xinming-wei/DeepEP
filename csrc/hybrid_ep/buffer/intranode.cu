@@ -3,6 +3,16 @@
 // All rights reserved
 #include "intranode.cuh"
 
+namespace {
+
+inline int64_t get_intra_node_prob_stride(const BufferConfig& config) {
+    return config.num_of_nodes == 1
+        ? static_cast<int64_t>(config.num_of_experts_per_rank)
+        : static_cast<int64_t>(config.num_of_experts_per_rank) * config.num_of_ranks_per_node;
+}
+
+}  // namespace
+
 NVLCoordinator::~NVLCoordinator() {
     destroy();
 }
@@ -120,8 +130,7 @@ void NVLCoordinator::allocate_dispatch_buffers() {
   
     // Calculate buffer sizes
     auto expert_output_token_elts = max_num_of_tokens * buffer_config.hidden_dim;
-    auto expert_output_prob_elts = max_num_of_tokens * 
-                                   (buffer_config.num_of_experts_per_rank * buffer_config.num_of_ranks_per_node);
+    auto expert_output_prob_elts = max_num_of_tokens * get_intra_node_prob_stride(buffer_config);
     auto expert_output_scaling_factor_elts = max_num_of_tokens * (buffer_config.hidden_dim / 128);
   
     // Allocate main buffers
@@ -165,8 +174,7 @@ void NVLCoordinator::allocate_dispatch_buffers() {
 void NVLCoordinator::allocate_combine_buffers() {
     // Calculate buffer sizes
     auto expert_input_token_elts = max_num_of_tokens * buffer_config.hidden_dim;
-    auto expert_input_prob_elts = max_num_of_tokens *
-                                  (buffer_config.num_of_experts_per_rank * buffer_config.num_of_ranks_per_node);
+    auto expert_input_prob_elts = max_num_of_tokens * get_intra_node_prob_stride(buffer_config);
 
     // Allocate main buffers
     remote_allocator->allocate((void**)&combine_buffers.expert_input_token, expert_input_token_elts * sizeof(uint16_t));

@@ -349,9 +349,9 @@ struct combine_kernel_dynamic_shared_memory_buffer_t<NUM_OF_STAGES_G2S, NUM_OF_S
   // Shared memory token buffer for inter node red warp group S2G data movement. Should be 128B alignment for optimal perf for TMA.
   alignas(128) uint16_t inter_node_token_S2G_buffer[NUM_OF_STAGES_S2G][HIDDEN_DIM];
 
-  // Shared memory prob buffer for inter node red warp group G2S data movement. Should be 16B alignment so can be used with TMA. 128B is too strict.
-  // Only used in BW combine.
-  alignas(16) float inter_node_prob_G2S_buffer[NUM_OF_STAGES_G2S][NUM_OF_EXPERTS_PER_RANK * NUM_OF_RANKS_PER_NODE];
+  // Shared memory prob buffer for inter node red warp group G2S data movement.
+  // In the single-node fast path we only stage the source rank's local expert slice.
+  alignas(16) float inter_node_prob_G2S_buffer[NUM_OF_STAGES_G2S][NUM_OF_EXPERTS_PER_RANK];
   // Shared memory prob buffer for inter node red warp group S2G data movement. Should be 16B alignment so can be used with TMA. 128B is too strict.
   // Only used in BW combine.
   alignas(16) float inter_node_prob_S2G_buffer[NUM_OF_STAGES_S2G][NUM_OF_EXPERTS_PER_RANK * NUM_OF_RANKS_PER_NODE];
@@ -361,6 +361,7 @@ struct combine_kernel_dynamic_shared_memory_buffer_t<NUM_OF_STAGES_G2S, NUM_OF_S
 
   // Endgroup flag for each token entry in G2S buffer. true means that this token is the last token of a intra-node reduction group, otherwise not.
   bool inter_node_flag_G2S_buffer[NUM_OF_STAGES_G2S];
+  uint8_t inter_node_prob_src_rank_G2S_buffer[NUM_OF_STAGES_G2S];
 };
 
 #ifdef HYBRID_EP_BUILD_MULTINODE_ENABLE
@@ -1050,12 +1051,24 @@ inline __device__ void S2G_warp_group_device_function(const int local_rank,
 
                     // Store the prob from shared to remote global for FW dispatch.
                     if constexpr(FORWARD_DISPATCH){
-                      float* remote_prob_addr = remote_expert_output_prob[remote_rank_id] + (output_buffer_index * (NUM_OF_EXPERTS_PER_RANK * NUM_OF_RANKS_PER_NODE));
-                      cuda::ptx::cp_async_bulk(cuda::ptx::space_global,
-                                               cuda::ptx::space_shared,
-                                               reinterpret_cast<void*>(remote_prob_addr),
-                                               reinterpret_cast<const void*>(&smem_buffer_ptr->intra_node_prob_buffer[stage][0]),
-                                               (uint32_t)((NUM_OF_EXPERTS_PER_RANK * NUM_OF_RANKS_PER_NODE) * sizeof(float)));
+                      if constexpr(NUM_OF_NODES == 1){
+                        float* remote_prob_addr =
+                            remote_expert_output_prob[remote_rank_id] +
+                            (output_buffer_index * NUM_OF_EXPERTS_PER_RANK);
+                        const float* local_prob_addr =
+                            &smem_buffer_ptr->intra_node_prob_buffer[stage][remote_rank_id * NUM_OF_EXPERTS_PER_RANK];
+                        #pragma unroll
+                        for(int prob_idx = 0; prob_idx < NUM_OF_EXPERTS_PER_RANK; ++prob_idx){
+                          remote_prob_addr[prob_idx] = local_prob_addr[prob_idx];
+                        }
+                      }else{
+                        float* remote_prob_addr = remote_expert_output_prob[remote_rank_id] + (output_buffer_index * (NUM_OF_EXPERTS_PER_RANK * NUM_OF_RANKS_PER_NODE));
+                        cuda::ptx::cp_async_bulk(cuda::ptx::space_global,
+                                                 cuda::ptx::space_shared,
+                                                 reinterpret_cast<void*>(remote_prob_addr),
+                                                 reinterpret_cast<const void*>(&smem_buffer_ptr->intra_node_prob_buffer[stage][0]),
+                                                 (uint32_t)((NUM_OF_EXPERTS_PER_RANK * NUM_OF_RANKS_PER_NODE) * sizeof(float)));
+                      }
 
                     }
 
@@ -1918,14 +1931,28 @@ inline __device__ void inter_node_G2S_warp_group_device_function(const int node_
                   total_tx_size += (uint32_t)(HIDDEN_DIM * sizeof(uint16_t));
 
                   if constexpr(BACKWARD_COMBINE){
-                    cuda::ptx::cp_async_bulk(cuda::ptx::space_shared,
-                                             cuda::ptx::space_global,
-                                             reinterpret_cast<void*>(&smem_buffer_ptr->inter_node_prob_G2S_buffer[token_stage][0]),
-                                             reinterpret_cast<const void*>(remote_expert_input_prob[current_src_token_id] + (sparse_to_dense_map_value * (NUM_OF_EXPERTS_PER_RANK * NUM_OF_RANKS_PER_NODE))),
-                                             (uint32_t)((NUM_OF_EXPERTS_PER_RANK * NUM_OF_RANKS_PER_NODE) * sizeof(float)),
-                                             &smem_buffer_ptr->inter_node_mbarrier_G2S_buffer[token_stage][0]);
+                    if constexpr(NUM_OF_NODES == 1){
+                      const float* local_prob_addr =
+                          remote_expert_input_prob[current_src_token_id] +
+                          (sparse_to_dense_map_value * NUM_OF_EXPERTS_PER_RANK);
+                      #pragma unroll
+                      for(int prob_idx = 0; prob_idx < NUM_OF_EXPERTS_PER_RANK; ++prob_idx){
+                        smem_buffer_ptr->inter_node_prob_G2S_buffer[token_stage][prob_idx] =
+                            local_prob_addr[prob_idx];
+                      }
+                      smem_buffer_ptr->inter_node_prob_src_rank_G2S_buffer[token_stage] =
+                          static_cast<uint8_t>(current_src_token_id);
+                      __threadfence_block();
+                    }else{
+                      cuda::ptx::cp_async_bulk(cuda::ptx::space_shared,
+                                               cuda::ptx::space_global,
+                                               reinterpret_cast<void*>(&smem_buffer_ptr->inter_node_prob_G2S_buffer[token_stage][0]),
+                                               reinterpret_cast<const void*>(remote_expert_input_prob[current_src_token_id] + (sparse_to_dense_map_value * (NUM_OF_EXPERTS_PER_RANK * NUM_OF_RANKS_PER_NODE))),
+                                               (uint32_t)((NUM_OF_EXPERTS_PER_RANK * NUM_OF_RANKS_PER_NODE) * sizeof(float)),
+                                               &smem_buffer_ptr->inter_node_mbarrier_G2S_buffer[token_stage][0]);
 
-                    total_tx_size += (uint32_t)((NUM_OF_EXPERTS_PER_RANK * NUM_OF_RANKS_PER_NODE) * sizeof(float));
+                      total_tx_size += (uint32_t)((NUM_OF_EXPERTS_PER_RANK * NUM_OF_RANKS_PER_NODE) * sizeof(float));
+                    }
                   }
 
                   if(current_src_token_id == last_src_token_id){
@@ -2214,12 +2241,24 @@ inline __device__ void inter_node_red_warp_group_device_function(const int node_
             }
 
             if constexpr(BACKWARD_COMBINE){
-              #pragma unroll
-              for(int n = 0; n < NUM_OF_PROB_VEC_ELEMENT_PER_THREAD; n++){
-                int element_id = thread_rank_within_pipeline + n * NUM_OF_THREADS_PER_PIPELINE;
-                if(element_id < NUM_OF_EXPERTS_PER_RANK * NUM_OF_RANKS_PER_NODE){
-                  float src_data = load_prob_base_ptr[element_id];
-                  acc_prob[0][n] += src_data;
+              if constexpr(NUM_OF_NODES == 1){
+                int src_rank = static_cast<int>(smem_buffer_ptr->inter_node_prob_src_rank_G2S_buffer[token_stage]);
+                int src_rank_base = src_rank * NUM_OF_EXPERTS_PER_RANK;
+                #pragma unroll
+                for(int n = 0; n < NUM_OF_PROB_VEC_ELEMENT_PER_THREAD; n++){
+                  int element_id = thread_rank_within_pipeline + n * NUM_OF_THREADS_PER_PIPELINE;
+                  if(element_id >= src_rank_base && element_id < src_rank_base + NUM_OF_EXPERTS_PER_RANK){
+                    acc_prob[0][n] += load_prob_base_ptr[element_id - src_rank_base];
+                  }
+                }
+              }else{
+                #pragma unroll
+                for(int n = 0; n < NUM_OF_PROB_VEC_ELEMENT_PER_THREAD; n++){
+                  int element_id = thread_rank_within_pipeline + n * NUM_OF_THREADS_PER_PIPELINE;
+                  if(element_id < NUM_OF_EXPERTS_PER_RANK * NUM_OF_RANKS_PER_NODE){
+                    float src_data = load_prob_base_ptr[element_id];
+                    acc_prob[0][n] += src_data;
+                  }
                 }
               }
             }
@@ -2472,7 +2511,8 @@ template<typename TOKEN_DATA_TYPE,
          bool FORWARD_DISPATCH>
 // Each CUDA block of dispatch kernel has 3 warp groups and has the following layout: 
 // 1. inter-node warp group(i.e. RDMA N2N warp group, 1 warp, only valid for multinode scenario) 2. intra-node G2S warp group(i.e. NVL G2S warp group, 1 warp). 
-// 3. intra-node S2G warp group(i.e. NVL S2G warp group, 2(multinode scenario)-3(single-node scenario) warps). Total 4 warps per CUDA block/SM.
+// 3. intra-node S2G warp group(i.e. NVL S2G warp group, 2(multinode scenario)-3/6(single-node scenario) warps).
+// Large single-node NVL domains are more sensitive to fragmented token fanout, so we widen the S2G group there.
 __launch_bounds__(INTER_NODE_GROUP::size() + INTRA_NODE_G2S_GROUP::size() + INTRA_NODE_S2G_GROUP::size(), 1)
 __global__ void dispatch_kernel(const __grid_constant__ dispatch_kernel_param_t<TOKEN_DATA_TYPE> param)
 {
@@ -2581,10 +2621,10 @@ template<// This type represent intra-node reduction warp group.
          int NUM_OF_ADDITIONAL_IN_FLIGHT_S2G, 
          // Whether the combine kernel is used in backward process. If so, need to transfer the prob for each token as well.
          bool BACKWARD_COMBINE>
-// Each CUDA block of combine kernel has 5 warp groups and has the following layout: 
-// 1. intra-node reduction warp group(4 warps, only valid for multinode scenario). 2. inter-node reduction warp group(4 warps, 1 pipeline for multinode scenario, 2 pipeline otherwise).
-// 3. intra-node G2S warp group(1 warp, only valid for multinode scenario). 4. inter-node G2S warp group(1 warp for multinode scenario, 2 warps otherwise). 5. inter-node N2N rdma warp group(1 warp, only valid for multinode scenario). 
-// Total 6(single-node) or 11(multi-node) warps per CUDA block/SM.
+// Each CUDA block of combine kernel has 5 warp groups and has the following layout:
+// 1. intra-node reduction warp group(4 warps, only valid for multinode scenario). 2. inter-node reduction warp group(4 warps, 1 pipeline for multinode scenario, 2/4 pipeline otherwise).
+// 3. intra-node G2S warp group(1 warp, only valid for multinode scenario). 4. inter-node G2S warp group(1 warp for multinode scenario, 2/4 warps otherwise). 5. inter-node N2N rdma warp group(1 warp, only valid for multinode scenario).
+// Total 6/12(single-node) or 11(multi-node) warps per CUDA block/SM.
 __launch_bounds__(INTRA_NODE_RED_GROUP::size() + INTER_NODE_RED_GROUP::size() + INTRA_NODE_G2S_GROUP::size() + INTER_NODE_G2S_GROUP::size() + INTER_NODE_RDMA_GROUP::size(), 1)
 __global__ void combine_kernel(const __grid_constant__ combine_kernel_param_t param)
 {
@@ -3195,9 +3235,11 @@ public:
     using INTRA_NODE_G2S_GROUP = warp_group<1, 1>;
     using INTRA_NODE_S2G_GROUP = warp_group<2, 2>;
 #else
+    static constexpr int SINGLE_NODE_S2G_WARPS =
+        (NUM_OF_RANKS_PER_NODE >= 32 ? 6 : 3);
     using INTER_NODE_GROUP = warp_group<0, 0>;
     using INTRA_NODE_G2S_GROUP = warp_group<1, 0>;
-    using INTRA_NODE_S2G_GROUP = warp_group<3, 1>;
+    using INTRA_NODE_S2G_GROUP = warp_group<SINGLE_NODE_S2G_WARPS, 1>;
 #endif
     // The shared memory needed by the dispatch kernel.
     using dispatch_kernel_smem_t = dispatch_kernel_dynamic_shared_memory_buffer_t<TOKEN_DATA_TYPE, NUM_OF_STAGES, HIDDEN_DIM, NUM_OF_TOKENS_PER_CHUNK,
@@ -3268,12 +3310,16 @@ public:
     using INTER_NODE_RDMA_GROUP = warp_group<1, 10>;
     constexpr int NUM_OF_DATA_PIPELINE_PER_BLOCK = 1;
 #else
+    static constexpr int NUM_OF_DATA_PIPELINE_PER_BLOCK =
+        (NUM_OF_RANKS_PER_NODE >= 32 ? 4 : 2);
+    static constexpr int SINGLE_NODE_RED_WARPS =
+        NUM_OF_DATA_PIPELINE_PER_BLOCK * 2;
     using INTRA_NODE_RED_GROUP = warp_group<0, 0>;
-    using INTER_NODE_RED_GROUP = warp_group<4, 0>;
-    using INTRA_NODE_G2S_GROUP = warp_group<0, 4>;
-    using INTER_NODE_G2S_GROUP = warp_group<2, 4>;
-    using INTER_NODE_RDMA_GROUP = warp_group<0, 6>;
-    constexpr int NUM_OF_DATA_PIPELINE_PER_BLOCK = 2;
+    using INTER_NODE_RED_GROUP = warp_group<SINGLE_NODE_RED_WARPS, 0>;
+    using INTRA_NODE_G2S_GROUP = warp_group<0, SINGLE_NODE_RED_WARPS>;
+    using INTER_NODE_G2S_GROUP = warp_group<NUM_OF_DATA_PIPELINE_PER_BLOCK, SINGLE_NODE_RED_WARPS>;
+    using INTER_NODE_RDMA_GROUP =
+        warp_group<0, SINGLE_NODE_RED_WARPS + NUM_OF_DATA_PIPELINE_PER_BLOCK>;
 #endif
     static_assert(INTER_NODE_G2S_GROUP::warp_size() == NUM_OF_DATA_PIPELINE_PER_BLOCK, "Inter-node G2S warp group pipeline and inter-node red warp group pipeline mismatch.");
 

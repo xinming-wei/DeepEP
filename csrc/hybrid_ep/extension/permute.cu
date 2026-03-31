@@ -321,12 +321,14 @@
                                 ProbType* permuted_probs,
                                 int* row_id_map,
                                 int* num_dispatched_tokens_ptr,
+                               int prob_stride,
                                 int pad_multiple,
                                 int num_of_local_experts,
                                 int hidden_size,
                                 int scales_per_token,
                                 int local_rank,
-                                int num_ranks_per_node) {
+                               int num_ranks_per_node,
+                               bool probs_are_local) {
    // Index of the current token
    // Each extended warp contains 4 warps, and will dispatch 1 tokens to
    // multi-experts
@@ -389,9 +391,10 @@
         for (int64_t i = 0; i < num_of_local_experts; i++) {
           int64_t dest_token_id = expert_routing_map[extended_warp_id * num_of_local_experts + i];
           if (dest_token_id > 0) {
-            permuted_probs[dest_token_id - 1] =
-                probs[token_id * num_of_local_experts * num_ranks_per_node +
-                      local_rank * num_of_local_experts + i];
+            permuted_probs[dest_token_id - 1] = probs_are_local
+                ? probs[token_id * prob_stride + i]
+                : probs[token_id * num_of_local_experts * num_ranks_per_node +
+                        local_rank * num_of_local_experts + i];
           } else if (dest_token_id < 0) {
             permuted_probs[(-dest_token_id - 1)] = 0;
           }
@@ -449,12 +452,14 @@
        args.with_probs ? permuted_probs.data_ptr<float>() : nullptr, 
        args.row_id_map.data_ptr<int>(),
        args.num_dispatched_token_tensor.data_ptr<int>(), 
+      args.prob_stride,
        args.pad_multiple, 
        args.num_of_local_experts, 
        args.hidden_size,
        args.scales_per_token, 
        args.local_rank, 
-       args.num_ranks_per_node
+      args.num_ranks_per_node,
+      args.probs_are_local
     );
    CUDA_CHECK(cudaGetLastError());
  
@@ -469,9 +474,11 @@
                                   int* row_id_map,
                                   int* num_dispatched_tokens_ptr,
                                   int num_of_local_experts,
+                                 int prob_stride,
                                   int hidden_size,
                                   int local_rank,
-                                  int num_ranks_per_node) {
+                                 int num_ranks_per_node,
+                                 bool probs_are_local) {
    // Index of the current token
    // Each extended warp contains 4 warps, and will reduce multi-experts tokens
    // to 1 token
@@ -529,17 +536,31 @@
     
       // If use probs, unpermute the probs
       if (permuted_probs != nullptr) {
-        for (int64_t j = extended_laned_id; j < num_of_local_experts * num_ranks_per_node; j += 128) {
-          float value = 0.0f;
-          if (j / num_of_local_experts == local_rank) {
-            int64_t source_token_id =
-                expert_routing_map[extended_warp_id * num_of_local_experts + j % num_of_local_experts];
-            if (source_token_id > 0) {
-              value = static_cast<float>(permuted_probs[source_token_id - 1]);
+        if (probs_are_local) {
+          for (int64_t j = extended_laned_id; j < prob_stride; j += 128) {
+            float value = 0.0f;
+            if (j < num_of_local_experts) {
+              int64_t source_token_id =
+                  expert_routing_map[extended_warp_id * num_of_local_experts + j];
+              if (source_token_id > 0) {
+                value = static_cast<float>(permuted_probs[source_token_id - 1]);
+              }
             }
+            probs[token_id * prob_stride + j] = static_cast<ProbType>(value);
           }
-          probs[token_id * num_of_local_experts * num_ranks_per_node + j] =
-              static_cast<ProbType>(value);
+        } else {
+          for (int64_t j = extended_laned_id; j < num_of_local_experts * num_ranks_per_node; j += 128) {
+            float value = 0.0f;
+            if (j / num_of_local_experts == local_rank) {
+              int64_t source_token_id =
+                  expert_routing_map[extended_warp_id * num_of_local_experts + j % num_of_local_experts];
+              if (source_token_id > 0) {
+                value = static_cast<float>(permuted_probs[source_token_id - 1]);
+              }
+            }
+            probs[token_id * num_of_local_experts * num_ranks_per_node + j] =
+                static_cast<ProbType>(value);
+          }
         }
       }
     } // if (token_id < num_dispatched_tokens)
@@ -571,9 +592,11 @@
        args.row_id_map.data_ptr<int>(),
        args.num_dispatched_tokens_tensor.data_ptr<int>(), 
        args.num_of_local_experts, 
+      args.prob_stride,
        args.hidden_size, 
        args.local_rank,
-       args.num_ranks_per_node
+      args.num_ranks_per_node,
+      args.probs_are_local
     );
  
    CUDA_CHECK(cudaGetLastError());

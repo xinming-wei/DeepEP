@@ -23,14 +23,16 @@ struct PermuteArgs {
   int scales_per_token; // Now is hidden_size/128
   torch::Tensor num_dispatched_token_tensor; // We assume it is only valid on GPU
   int num_permuted_token;
-  int num_ranks_per_node; // Probs dimension 0 = num_ranks_per_node * num_of_local_experts
+  int num_ranks_per_node; // Used when probs_ptr stores a dense per-node expert slice
   int num_of_local_experts;
+  int prob_stride; // Internal stride of probs_ptr, can be local-expert-only on intra-node fast path
   int pad_multiple;
 
   // Misc
   int local_rank;
   bool use_fp8;
   bool with_probs;
+  bool probs_are_local;
   int num_of_blocks_permute_api;
   torch::TensorOptions token_options; // To record the Dtype of the input tokens from the expert mlp, maybe bf16/fp16/fp8...
   cudaStream_t stream;
@@ -49,6 +51,7 @@ struct UnpermuteArgs {
   // The shape message of the output
   int num_of_local_experts;
   torch::Tensor num_dispatched_tokens_tensor; // We assume it is only valid on GPU
+  int prob_stride; // Internal stride of probs_ptr, can be local-expert-only on intra-node fast path
   int pad_multiple;
   int hidden_size;
 
@@ -56,6 +59,7 @@ struct UnpermuteArgs {
   int local_rank;
   int num_ranks_per_node;
   bool with_probs;
+  bool probs_are_local;
   int num_of_blocks_permute_api;
   cudaStream_t stream;
 };

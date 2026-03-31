@@ -6,6 +6,19 @@ import shutil
 import hybrid_ep_cpp
 import warnings
 
+
+def _round_up_to_multiple(value: int, multiple: int) -> int:
+    if multiple <= 1:
+        return value
+    return ((value + multiple - 1) // multiple) * multiple
+
+
+def _sanitize_in_flight(num_stages: int, num_in_flight: int) -> int:
+    if num_stages <= 1:
+        return 0
+    return min(num_in_flight, num_stages - 1)
+
+
 def indices_to_map(
     topk_idx: torch.Tensor,
     topk_weights: torch.Tensor,
@@ -83,6 +96,10 @@ class HybridEPBuffer:
         # The number of nodes.
         self.num_of_nodes = self.group_size // self.num_of_hybrid_ep_ranks_per_nvlink_domain
         self.use_fp8 = use_fp8
+        self.large_intra_node_domain = (
+            self.num_of_nodes == 1
+            and self.num_of_hybrid_ep_ranks_per_nvlink_domain >= 64
+        )
 
         props = torch.cuda.get_device_properties(torch.cuda.current_device())
         sm_count = props.multi_processor_count
@@ -204,11 +221,17 @@ class HybridEPBuffer:
         config.num_of_blocks_dispatch_api = self.num_sms_dispatch_api
         config.device_side_sync_dispatch_api = True
         # Dispatch stages config:
+        dispatch_stage_default = "12" if self.large_intra_node_domain else "10"
+        dispatch_in_flight_default = "10" if self.large_intra_node_domain else "8"
         config.num_of_stages_dispatch_api = int(
-            os.getenv("NUM_OF_STAGES_DISPATCH_API", "10")
+            os.getenv("NUM_OF_STAGES_DISPATCH_API", dispatch_stage_default)
         )
         config.num_of_in_flight_s2g_dispatch_api = int(
-            os.getenv("NUM_OF_IN_FLIGHT_S2G_DISPATCH_API", "8")
+            os.getenv("NUM_OF_IN_FLIGHT_S2G_DISPATCH_API", dispatch_in_flight_default)
+        )
+        config.num_of_in_flight_s2g_dispatch_api = _sanitize_in_flight(
+            config.num_of_stages_dispatch_api,
+            config.num_of_in_flight_s2g_dispatch_api,
         )
         config.num_of_tokens_per_chunk_dispatch_api = int(
             os.getenv("NUM_OF_TOKENS_PER_CHUNK_DISPATCH_API", "128")
@@ -219,16 +242,35 @@ class HybridEPBuffer:
         config.device_side_sync_combine_api = True
         # Combine stages config:
         if self.config.num_of_nodes > 1:
+            single_node_pipeline_multiple = 1
             config.num_of_stages_g2s_combine_api = int(
                 os.getenv("NUM_OF_STAGES_G2S_COMBINE_API", "5")
             )
         else:
+            single_node_pipeline_multiple = 4 if self.large_intra_node_domain else 2
             config.num_of_stages_g2s_combine_api = int(
-                os.getenv("NUM_OF_STAGES_G2S_COMBINE_API", "10")
+                os.getenv(
+                    "NUM_OF_STAGES_G2S_COMBINE_API",
+                    "12" if self.large_intra_node_domain else "10",
+                )
             )
         config.num_of_stages_s2g_combine_api = int(
-            os.getenv("NUM_OF_STAGES_S2G_COMBINE_API", "2")
+            os.getenv(
+                "NUM_OF_STAGES_S2G_COMBINE_API",
+                "4" if self.large_intra_node_domain else "2",
+            )
         )
+        if self.config.num_of_nodes == 1:
+            # The widened single-node combine pipeline requires stage counts to be
+            # aligned with the number of pipelines used by the kernel layout.
+            config.num_of_stages_g2s_combine_api = _round_up_to_multiple(
+                max(config.num_of_stages_g2s_combine_api, single_node_pipeline_multiple),
+                single_node_pipeline_multiple,
+            )
+            config.num_of_stages_s2g_combine_api = _round_up_to_multiple(
+                max(config.num_of_stages_s2g_combine_api, single_node_pipeline_multiple),
+                single_node_pipeline_multiple,
+            )
         config.num_of_tokens_per_chunk_combine_api = int(
             os.getenv("NUM_OF_TOKENS_PER_CHUNK_COMBINE_API", "128")
         )

@@ -183,6 +183,7 @@ def get_extension_deep_ep_cpp():
             disable_nvshmem = True
     else:
         disable_nvshmem = False
+    disable_nvshmem = True
 
     if not disable_nvshmem:
         assert os.path.exists(nvshmem_dir), f'The specified NVSHMEM directory does not exist: {nvshmem_dir}'
